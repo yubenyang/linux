@@ -189,6 +189,7 @@ struct zpool *zpool_create_pool(const char *type, const char *name, gfp_t gfp,
 	}
 
 	pr_debug("created pool type %s\n", type);
+	pr_info("custom_zpool:zpool_create_pool");
 
 	return zpool;
 }

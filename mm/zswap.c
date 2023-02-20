@@ -205,7 +205,25 @@ struct zswap_tree {
 	spinlock_t lock;
 };
 
-static struct zswap_tree *zswap_trees[MAX_SWAPFILES];
+#define TREES_PER_SWAPFILE 8
+#define TREE_MASK 7UL
+
+static struct zswap_tree *zswap_trees[MAX_SWAPFILES * TREES_PER_SWAPFILE];
+
+static inline unsigned zswap_tree_hash(unsigned type, pgoff_t offset)
+{
+	return type * TREES_PER_SWAPFILE + (offset & TREE_MASK);
+}
+
+static inline unsigned zswap_tree_hash_start(unsigned type)
+{
+	return type * TREES_PER_SWAPFILE;
+}
+
+static inline unsigned zswap_tree_hash_end(unsigned type)
+{
+	return (type + 1) * TREES_PER_SWAPFILE;
+}
 
 /* RCU-protected iteration */
 static LIST_HEAD(zswap_pools);
@@ -966,8 +984,8 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
 	/* extract swpentry from data */
 	zhdr = zpool_map_handle(pool, handle, ZPOOL_MM_RO);
 	swpentry = zhdr->swpentry; /* here */
-	tree = zswap_trees[swp_type(swpentry)];
 	offset = swp_offset(swpentry);
+	tree = zswap_trees[zswap_tree_hash(swp_type(swpentry), offset)];
 
 	/* find and ref zswap entry */
 	spin_lock(&tree->lock);
@@ -1097,7 +1115,7 @@ static void zswap_fill_page(void *ptr, unsigned long value)
 static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 				struct page *page)
 {
-	struct zswap_tree *tree = zswap_trees[type];
+	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry, *dupentry;
 	struct scatterlist input, output;
 	struct crypto_acomp_ctx *acomp_ctx;
@@ -1284,7 +1302,7 @@ shrink:
 static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 				struct page *page)
 {
-	struct zswap_tree *tree = zswap_trees[type];
+	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry;
 	struct scatterlist input, output;
 	struct crypto_acomp_ctx *acomp_ctx;
@@ -1360,7 +1378,7 @@ freeentry:
 /* frees an entry in zswap */
 static void zswap_frontswap_invalidate_page(unsigned type, pgoff_t offset)
 {
-	struct zswap_tree *tree = zswap_trees[type];
+	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry;
 
 	/* find */
@@ -1381,10 +1399,10 @@ static void zswap_frontswap_invalidate_page(unsigned type, pgoff_t offset)
 	spin_unlock(&tree->lock);
 }
 
-/* frees all zswap entries for the given swap type */
-static void zswap_frontswap_invalidate_area(unsigned type)
+/* frees all zswap entries for the given swap pos */
+static void __zswap_frontswap_invalidate_area(unsigned pos)
 {
-	struct zswap_tree *tree = zswap_trees[type];
+	struct zswap_tree *tree = zswap_trees[pos];
 	struct zswap_entry *entry, *n;
 
 	if (!tree)
@@ -1397,22 +1415,34 @@ static void zswap_frontswap_invalidate_area(unsigned type)
 	tree->rbroot = RB_ROOT;
 	spin_unlock(&tree->lock);
 	kfree(tree);
-	zswap_trees[type] = NULL;
+	zswap_trees[pos] = NULL;
 }
 
-static void zswap_frontswap_init(unsigned type)
+static void zswap_frontswap_invalidate_area(unsigned type)
+{
+	for(unsigned pos = zswap_tree_hash_start(type); pos < zswap_tree_hash_end(type); pos++) 
+		__zswap_frontswap_invalidate_area(pos);
+}
+
+static void __zswap_frontswap_init(unsigned type, unsigned pos)
 {
 	struct zswap_tree *tree;
 
 	tree = kzalloc(sizeof(*tree), GFP_KERNEL);
 	if (!tree) {
-		pr_err("alloc failed, zswap disabled for swap type %d\n", type);
+		pr_err("alloc failed, zswap disabled for swap type %d pos %d\n", type, pos);
 		return;
 	}
 
 	tree->rbroot = RB_ROOT;
 	spin_lock_init(&tree->lock);
-	zswap_trees[type] = tree;
+	zswap_trees[pos] = tree;
+}
+
+static void zswap_frontswap_init(unsigned type)
+{
+	for(unsigned pos = zswap_tree_hash_start(type); pos < zswap_tree_hash_end(type); pos++) 
+		__zswap_frontswap_init(type, pos);
 }
 
 static const struct frontswap_ops zswap_frontswap_ops = {
@@ -1517,6 +1547,7 @@ static int __init init_zswap(void)
 		goto destroy_wq;
 	if (zswap_debugfs_init())
 		pr_warn("debugfs initialization failed\n");
+	pr_info("custom_zswap:init_zswap");
 	return 0;
 
 destroy_wq:

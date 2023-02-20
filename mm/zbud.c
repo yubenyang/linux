@@ -622,7 +622,7 @@ static int __init init_zbud(void)
 	pr_info("loaded\n");
 
 	zpool_register_driver(&zbud_zpool_driver);
-
+	pr_info("custom_zbud:init_zbud");
 	return 0;
 }
 
