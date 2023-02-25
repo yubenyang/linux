@@ -28,6 +28,8 @@
 #include <linux/mempool.h>
 #include <linux/zpool.h>
 #include <crypto/acompress.h>
+#include <linux/lzo.h>
+#include <crypto/scatterwalk.h>
 
 #include <linux/mm_types.h>
 #include <linux/page-flags.h>
@@ -157,6 +159,17 @@ struct zswap_pool {
 	struct hlist_node node;
 	char tfm_name[CRYPTO_MAX_ALG_NAME];
 };
+
+struct lzo_ctx {
+	struct mutex *mutex_comp;
+	struct mutex *mutex_decomp;
+	u8 *src_comp;
+	u8 *dst_comp;
+	u8 *dst_decomp;
+	void *wrkmem;
+};
+
+struct lzo_ctx __percpu *lzo_ctx;
 
 /*
  * struct zswap_entry
@@ -440,37 +453,71 @@ static DEFINE_PER_CPU(struct mutex *, zswap_mutex);
 
 static int zswap_dstmem_prepare(unsigned int cpu)
 {
-	struct mutex *mutex;
-	u8 *dst;
+	struct mutex *mutex_comp, *mutex_decomp;
+	u8 *src_comp, *dst_comp, *dst_decomp;
+	void *wrkmem;
+	struct lzo_ctx *ctx = per_cpu_ptr(lzo_ctx, cpu);
 
-	dst = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
-	if (!dst)
-		return -ENOMEM;
+	src_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+	if (!src_comp)
+		goto src_comp_fail;
+		
+	dst_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+	if (!dst_comp)
+		goto dst_comp_fail;
 
-	mutex = kmalloc_node(sizeof(*mutex), GFP_KERNEL, cpu_to_node(cpu));
-	if (!mutex) {
-		kfree(dst);
-		return -ENOMEM;
-	}
+	dst_decomp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+	if (!dst_decomp)
+		goto dst_decomp_fail;
 
-	mutex_init(mutex);
-	per_cpu(zswap_dstmem, cpu) = dst;
-	per_cpu(zswap_mutex, cpu) = mutex;
+	mutex_comp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
+	if (!mutex_comp)
+		goto mutex_comp_fail;
+
+	mutex_decomp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
+	if (!mutex_decomp)
+		goto mutex_decomp_fail;
+
+	wrkmem = kvmalloc_node(LZO1X_MEM_COMPRESS, GFP_KERNEL, cpu_to_node(cpu));
+	if (!wrkmem)
+		goto wrkmem_fail;
+
+	mutex_init(mutex_comp);
+	mutex_init(mutex_decomp);
+	
+	ctx->src_comp = src_comp;
+	ctx->dst_comp = dst_comp;
+	ctx->dst_decomp = dst_decomp;
+	ctx->mutex_comp = mutex_comp;
+	ctx->mutex_decomp = mutex_decomp;
+	ctx->wrkmem = wrkmem;
+
 	return 0;
+
+wrkmem_fail:
+	kfree(mutex_decomp);
+mutex_decomp_fail:
+	kfree(mutex_comp);
+mutex_comp_fail:
+	kfree(dst_decomp);
+dst_decomp_fail:
+	kfree(dst_comp);
+dst_comp_fail:
+	kfree(src_comp);
+src_comp_fail:
+	return -ENOMEM;
 }
 
 static int zswap_dstmem_dead(unsigned int cpu)
 {
-	struct mutex *mutex;
-	u8 *dst;
+	struct lzo_ctx *ctx = per_cpu_ptr(lzo_ctx, cpu);
 
-	mutex = per_cpu(zswap_mutex, cpu);
-	kfree(mutex);
-	per_cpu(zswap_mutex, cpu) = NULL;
-
-	dst = per_cpu(zswap_dstmem, cpu);
-	kfree(dst);
-	per_cpu(zswap_dstmem, cpu) = NULL;
+	kvfree(ctx->wrkmem);
+	kfree(ctx->mutex_decomp);
+	kfree(ctx->mutex_comp);
+	kfree(ctx->dst_decomp);
+	kfree(ctx->dst_comp);
+	kfree(ctx->src_comp);
 
 	return 0;
 }
@@ -965,8 +1012,8 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
 	pgoff_t offset;
 	struct zswap_entry *entry;
 	struct page *page;
-	struct scatterlist input, output;
-	struct crypto_acomp_ctx *acomp_ctx;
+	struct scatterlist output;
+	struct lzo_ctx *ctx;
 
 	u8 *src, *tmp = NULL;
 	unsigned int dlen;
@@ -1021,17 +1068,16 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
 
 	case ZSWAP_SWAPCACHE_NEW: /* page is locked */
 		/* decompress */
-		acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
-		dlen = PAGE_SIZE;
 
-		mutex_lock(acomp_ctx->mutex);
-		sg_init_one(&input, src, entry->length);
+		ctx = raw_cpu_ptr(lzo_ctx);
+		mutex_lock(ctx->mutex_decomp);
 		sg_init_table(&output, 1);
 		sg_set_page(&output, page, PAGE_SIZE, 0);
-		acomp_request_set_params(acomp_ctx->req, &input, &output, entry->length, dlen);
-		ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
-		dlen = acomp_ctx->req->dlen;
-		mutex_unlock(acomp_ctx->mutex);
+		size_t dlen_l = PAGE_SIZE;
+		ret = lzo1x_decompress_safe(src, entry->length, ctx->dst_decomp, &dlen_l);
+		dlen = dlen_l;
+		scatterwalk_map_and_copy(ctx->dst_decomp, &output, 0, dlen, 1);
+		mutex_unlock(ctx->mutex_decomp);
 
 		BUG_ON(ret);
 		BUG_ON(dlen != PAGE_SIZE);
@@ -1117,15 +1163,15 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 {
 	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry, *dupentry;
-	struct scatterlist input, output;
-	struct crypto_acomp_ctx *acomp_ctx;
+	struct scatterlist input;
+	struct lzo_ctx *ctx;
 	struct obj_cgroup *objcg = NULL;
 	struct zswap_pool *pool;
 	int ret;
 	unsigned int hlen, dlen = PAGE_SIZE;
 	unsigned long handle, value;
 	char *buf;
-	u8 *src, *dst;
+	u8 *src;
 	struct zswap_header zhdr = { .swpentry = swp_entry(type, offset) };
 	gfp_t gfp;
 
@@ -1193,31 +1239,16 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	}
 
 	/* compress */
-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+	ctx = raw_cpu_ptr(lzo_ctx);
 
-	mutex_lock(acomp_ctx->mutex);
+	mutex_lock(ctx->mutex_comp);
 
-	dst = acomp_ctx->dstmem;
 	sg_init_table(&input, 1);
 	sg_set_page(&input, page, PAGE_SIZE, 0);
-
-	/* zswap_dstmem is of size (PAGE_SIZE * 2). Reflect same in sg_list */
-	sg_init_one(&output, dst, PAGE_SIZE * 2);
-	acomp_request_set_params(acomp_ctx->req, &input, &output, PAGE_SIZE, dlen);
-	/*
-	 * it maybe looks a little bit silly that we send an asynchronous request,
-	 * then wait for its completion synchronously. This makes the process look
-	 * synchronous in fact.
-	 * Theoretically, acomp supports users send multiple acomp requests in one
-	 * acomp instance, then get those requests done simultaneously. but in this
-	 * case, frontswap actually does store and load page by page, there is no
-	 * existing method to send the second page before the first page is done
-	 * in one thread doing frontswap.
-	 * but in different threads running on different cpu, we have different
-	 * acomp instance, so multiple threads can do (de)compression in parallel.
-	 */
-	ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
-	dlen = acomp_ctx->req->dlen;
+	scatterwalk_map_and_copy(ctx->src_comp, &input, 0, PAGE_SIZE, 0);
+	size_t dlen_l = dlen;
+	ret = lzo1x_1_compress(ctx->src_comp, PAGE_SIZE, ctx->dst_comp, &dlen_l, ctx->wrkmem);
+	dlen = dlen_l;
 
 	if (ret) {
 		ret = -EINVAL;
@@ -1240,9 +1271,9 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	}
 	buf = zpool_map_handle(entry->pool->zpool, handle, ZPOOL_MM_WO);
 	memcpy(buf, &zhdr, hlen);
-	memcpy(buf + hlen, dst, dlen);
+	memcpy(buf + hlen, ctx->dst_comp, dlen);
 	zpool_unmap_handle(entry->pool->zpool, handle);
-	mutex_unlock(acomp_ctx->mutex);
+	mutex_unlock(ctx->mutex_comp);
 
 	/* populate entry */
 	entry->offset = offset;
@@ -1275,10 +1306,11 @@ insert_entry:
 	zswap_update_total_size();
 	count_vm_event(ZSWPOUT);
 
+	//pr_info("custom_zswap:zswap_frontswap_store type %d pos %d", type, zswap_tree_hash(type, offset));
 	return 0;
 
 put_dstmem:
-	mutex_unlock(acomp_ctx->mutex);
+	mutex_unlock(ctx->mutex_comp);
 	zswap_pool_put(entry->pool);
 freepage:
 	zswap_entry_cache_free(entry);
@@ -1304,8 +1336,8 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 {
 	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry;
-	struct scatterlist input, output;
-	struct crypto_acomp_ctx *acomp_ctx;
+	struct scatterlist output;
+	struct lzo_ctx *ctx;
 	u8 *src, *dst, *tmp;
 	unsigned int dlen;
 	int ret;
@@ -1348,14 +1380,15 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
 	}
 
-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
-	mutex_lock(acomp_ctx->mutex);
-	sg_init_one(&input, src, entry->length);
+	ctx = raw_cpu_ptr(lzo_ctx);
+	mutex_lock(ctx->mutex_decomp);
 	sg_init_table(&output, 1);
 	sg_set_page(&output, page, PAGE_SIZE, 0);
-	acomp_request_set_params(acomp_ctx->req, &input, &output, entry->length, dlen);
-	ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
-	mutex_unlock(acomp_ctx->mutex);
+	size_t dlen_l = PAGE_SIZE;
+	ret = lzo1x_decompress_safe(src, entry->length, ctx->dst_decomp, &dlen_l);
+	dlen = dlen_l;
+	scatterwalk_map_and_copy(ctx->dst_decomp, &output, 0, dlen, 1);
+	mutex_unlock(ctx->mutex_decomp);
 
 	if (zpool_can_sleep_mapped(entry->pool->zpool))
 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
@@ -1372,6 +1405,7 @@ freeentry:
 	zswap_entry_put(tree, entry);
 	spin_unlock(&tree->lock);
 
+    //pr_info("custom_zswap:zswap_frontswap_load type %d pos %d", type, zswap_tree_hash(type, offset));
 	return ret;
 }
 
@@ -1441,8 +1475,10 @@ static void __zswap_frontswap_init(unsigned type, unsigned pos)
 
 static void zswap_frontswap_init(unsigned type)
 {
-	for(unsigned pos = zswap_tree_hash_start(type); pos < zswap_tree_hash_end(type); pos++) 
+	for(unsigned pos = zswap_tree_hash_start(type); pos < zswap_tree_hash_end(type); pos++) {
 		__zswap_frontswap_init(type, pos);
+		pr_info("custom_zswap:zswap_frontswap_init type %d pos %d", type, pos);
+	}
 }
 
 static const struct frontswap_ops zswap_frontswap_ops = {
@@ -1508,6 +1544,12 @@ static int __init init_zswap(void)
 
 	zswap_init_started = true;
 
+	lzo_ctx = alloc_percpu(*lzo_ctx);
+	if (!lzo_ctx) {
+		pr_err("percpu lzo ctx alloc failed\n");
+		goto lzo_fail;
+	}
+	
 	if (zswap_entry_cache_create()) {
 		pr_err("entry cache creation failed\n");
 		goto cache_fail;
@@ -1560,6 +1602,8 @@ hp_fail:
 dstmem_fail:
 	zswap_entry_cache_destroy();
 cache_fail:
+	free_percpu(lzo_ctx);
+lzo_fail:
 	/* if built-in, we aren't unloaded on failure; don't allow use */
 	zswap_init_failed = true;
 	zswap_enabled = false;
