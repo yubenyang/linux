@@ -1306,7 +1306,6 @@ insert_entry:
 	zswap_update_total_size();
 	count_vm_event(ZSWPOUT);
 
-	//pr_info("custom_zswap:zswap_frontswap_store type %d pos %d", type, zswap_tree_hash(type, offset));
 	return 0;
 
 put_dstmem:
@@ -1405,7 +1404,6 @@ freeentry:
 	zswap_entry_put(tree, entry);
 	spin_unlock(&tree->lock);
 
-    //pr_info("custom_zswap:zswap_frontswap_load type %d pos %d", type, zswap_tree_hash(type, offset));
 	return ret;
 }
 
