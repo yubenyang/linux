@@ -171,6 +171,24 @@ struct lzo_ctx {
 
 struct lzo_ctx __percpu *lzo_ctx;
 
+/*********************************
+* compress/decompress
+**********************************/
+
+static int zswap_lzo_decompress(const u8 *src, unsigned int slen, struct page *page, unsigned int *dlen)
+{
+	int ret;
+	u8 *dst;
+	size_t dlen_l = PAGE_SIZE;
+	
+	dst = kmap_local_page(page);
+	ret = lzo1x_decompress_safe(src, slen, dst, &dlen_l);
+	kunmap_local(dst);
+	
+	*dlen = dlen_l;
+	return ret;
+}
+
 /*
  * struct zswap_entry
  *
@@ -219,7 +237,7 @@ struct zswap_tree {
 };
 
 #define TREES_PER_SWAPFILE 8
-#define TREE_MASK 7UL
+#define TREE_MASK (TREES_PER_SWAPFILE - 1UL)
 
 static struct zswap_tree *zswap_trees[MAX_SWAPFILES * TREES_PER_SWAPFILE];
 
@@ -1012,8 +1030,6 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
 	pgoff_t offset;
 	struct zswap_entry *entry;
 	struct page *page;
-	struct scatterlist output;
-	struct lzo_ctx *ctx;
 
 	u8 *src, *tmp = NULL;
 	unsigned int dlen;
@@ -1069,15 +1085,7 @@ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle)
 	case ZSWAP_SWAPCACHE_NEW: /* page is locked */
 		/* decompress */
 
-		ctx = raw_cpu_ptr(lzo_ctx);
-		mutex_lock(ctx->mutex_decomp);
-		sg_init_table(&output, 1);
-		sg_set_page(&output, page, PAGE_SIZE, 0);
-		size_t dlen_l = PAGE_SIZE;
-		ret = lzo1x_decompress_safe(src, entry->length, ctx->dst_decomp, &dlen_l);
-		dlen = dlen_l;
-		scatterwalk_map_and_copy(ctx->dst_decomp, &output, 0, dlen, 1);
-		mutex_unlock(ctx->mutex_decomp);
+		ret = zswap_lzo_decompress(src, entry->length, page, &dlen);
 
 		BUG_ON(ret);
 		BUG_ON(dlen != PAGE_SIZE);
@@ -1335,8 +1343,6 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 {
 	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry;
-	struct scatterlist output;
-	struct lzo_ctx *ctx;
 	u8 *src, *dst, *tmp;
 	unsigned int dlen;
 	int ret;
@@ -1379,15 +1385,7 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
 	}
 
-	ctx = raw_cpu_ptr(lzo_ctx);
-	mutex_lock(ctx->mutex_decomp);
-	sg_init_table(&output, 1);
-	sg_set_page(&output, page, PAGE_SIZE, 0);
-	size_t dlen_l = PAGE_SIZE;
-	ret = lzo1x_decompress_safe(src, entry->length, ctx->dst_decomp, &dlen_l);
-	dlen = dlen_l;
-	scatterwalk_map_and_copy(ctx->dst_decomp, &output, 0, dlen, 1);
-	mutex_unlock(ctx->mutex_decomp);
+	ret = zswap_lzo_decompress(src, entry->length, page, &dlen);
 
 	if (zpool_can_sleep_mapped(entry->pool->zpool))
 		zpool_unmap_handle(entry->pool->zpool, entry->handle);
