@@ -30,6 +30,7 @@
 #include <crypto/acompress.h>
 #include <linux/lzo.h>
 #include <crypto/scatterwalk.h>
+#include <linux/limits.h>
 
 #include <linux/mm_types.h>
 #include <linux/page-flags.h>
@@ -162,18 +163,97 @@ struct zswap_pool {
 
 struct lzo_ctx {
 	struct mutex *mutex_comp;
-	struct mutex *mutex_decomp;
 	u8 *src_comp;
 	u8 *dst_comp;
-	u8 *dst_decomp;
 	void *wrkmem;
 };
 
-struct lzo_ctx __percpu *lzo_ctx;
+#define LZO_PER_CPU 4
+
+struct lzo_ctx_group {
+	struct lzo_ctx *ctxes[LZO_PER_CPU];
+	u8 wait_lists[LZO_PER_CPU];
+	spinlock_t lock;
+};
+
+struct lzo_ctx_group __percpu *lzo_ctx_group;
 
 /*********************************
-* compress/decompress
+* lzo code
 **********************************/
+
+static bool zswap_init_lzo_ctx(struct lzo_ctx *ctx, unsigned int cpu)
+{
+	ctx->src_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+	if (!ctx->src_comp) 
+		goto src_comp_fail;
+		
+	ctx->dst_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
+	if (!ctx->dst_comp) 
+		goto dst_comp_fail;
+
+	ctx->mutex_comp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
+	if (!ctx->mutex_comp) 
+		goto mutex_comp_fail;
+
+	ctx->wrkmem = kvmalloc_node(LZO1X_MEM_COMPRESS, GFP_KERNEL, cpu_to_node(cpu));
+	if (!ctx->wrkmem) 
+		goto wrkmem_fail;
+
+	mutex_init(ctx->mutex_comp);
+	return true;
+
+wrkmem_fail:
+	kfree(ctx->mutex_comp);
+mutex_comp_fail:
+	kfree(ctx->dst_comp);
+dst_comp_fail:
+	kfree(ctx->src_comp);
+src_comp_fail:
+	return false;
+}
+
+static void zswap_free_lzo_ctx(struct lzo_ctx *ctx) 
+{
+	kvfree(ctx->wrkmem);
+	kfree(ctx->mutex_comp);
+	kfree(ctx->dst_comp);
+	kfree(ctx->src_comp);
+	kfree(ctx);
+}
+
+static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
+{
+	
+	u8 wait_list = U8_MAX;
+	u8 tmp;
+	int ctx_idx;
+	
+	spin_lock(&ctx_group->lock);
+	
+	for (int i = 0; i < LZO_PER_CPU; i++) {
+		tmp = ctx_group->wait_lists[i];
+		if (tmp < wait_list) {
+			wait_list = tmp;
+			ctx_idx = i;
+		}
+		if (wait_list == 0) {
+			break;
+		}
+	}
+	(ctx_group->wait_lists[ctx_idx])++;
+
+	spin_unlock(&ctx_group->lock);
+
+	return ctx_idx;
+}
+
+static void zswap_return_lzo_ctx(struct lzo_ctx_group *ctx_group, int ctx_idx)
+{
+	spin_lock(&ctx_group->lock);
+	(ctx_group->wait_lists[ctx_idx])--;
+	spin_unlock(&ctx_group->lock);
+}
 
 static int zswap_lzo_decompress(const u8 *src, unsigned int slen, struct page *page, unsigned int *dlen)
 {
@@ -471,71 +551,38 @@ static DEFINE_PER_CPU(struct mutex *, zswap_mutex);
 
 static int zswap_dstmem_prepare(unsigned int cpu)
 {
-	struct mutex *mutex_comp, *mutex_decomp;
-	u8 *src_comp, *dst_comp, *dst_decomp;
-	void *wrkmem;
-	struct lzo_ctx *ctx = per_cpu_ptr(lzo_ctx, cpu);
+	struct lzo_ctx_group *ctx_group = per_cpu_ptr(lzo_ctx_group, cpu);
+	struct lzo_ctx *ctx;
+	int i = 0;
 
-	src_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
-	if (!src_comp)
-		goto src_comp_fail;
-		
-	dst_comp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
-	if (!dst_comp)
-		goto dst_comp_fail;
+	spin_lock_init(&ctx_group->lock);
 
-	dst_decomp = kmalloc_node(PAGE_SIZE * 2, GFP_KERNEL, cpu_to_node(cpu));
-	if (!dst_decomp)
-		goto dst_decomp_fail;
-
-	mutex_comp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
-	if (!mutex_comp)
-		goto mutex_comp_fail;
-
-	mutex_decomp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
-	if (!mutex_decomp)
-		goto mutex_decomp_fail;
-
-	wrkmem = kvmalloc_node(LZO1X_MEM_COMPRESS, GFP_KERNEL, cpu_to_node(cpu));
-	if (!wrkmem)
-		goto wrkmem_fail;
-
-	mutex_init(mutex_comp);
-	mutex_init(mutex_decomp);
+	for (; i < LZO_PER_CPU; i++) {
+		ctx = kmalloc_node(sizeof(*ctx), GFP_KERNEL, cpu_to_node(cpu));
+		if (!ctx)
+			goto fail;
+		if (!zswap_init_lzo_ctx(ctx, cpu))
+			goto fail;
+		ctx_group->ctxes[i] = ctx;
+		ctx_group->wait_lists[i] = 0;
+	}
 	
-	ctx->src_comp = src_comp;
-	ctx->dst_comp = dst_comp;
-	ctx->dst_decomp = dst_decomp;
-	ctx->mutex_comp = mutex_comp;
-	ctx->mutex_decomp = mutex_decomp;
-	ctx->wrkmem = wrkmem;
-
 	return 0;
 
-wrkmem_fail:
-	kfree(mutex_decomp);
-mutex_decomp_fail:
-	kfree(mutex_comp);
-mutex_comp_fail:
-	kfree(dst_decomp);
-dst_decomp_fail:
-	kfree(dst_comp);
-dst_comp_fail:
-	kfree(src_comp);
-src_comp_fail:
+fail:
+	for (int j = 0; j < i; j++)
+		zswap_free_lzo_ctx(ctx_group->ctxes[j]);
 	return -ENOMEM;
 }
 
 static int zswap_dstmem_dead(unsigned int cpu)
 {
-	struct lzo_ctx *ctx = per_cpu_ptr(lzo_ctx, cpu);
-
-	kvfree(ctx->wrkmem);
-	kfree(ctx->mutex_decomp);
-	kfree(ctx->mutex_comp);
-	kfree(ctx->dst_decomp);
-	kfree(ctx->dst_comp);
-	kfree(ctx->src_comp);
+	struct lzo_ctx_group *ctx_group = per_cpu_ptr(lzo_ctx_group, cpu);
+	
+	for (int i = 0; i < LZO_PER_CPU; i++) {
+		zswap_free_lzo_ctx(ctx_group->ctxes[i]);
+		ctx_group->ctxes[i] = NULL;
+	}
 
 	return 0;
 }
@@ -1172,6 +1219,8 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	struct zswap_tree *tree = zswap_trees[zswap_tree_hash(type, offset)];
 	struct zswap_entry *entry, *dupentry;
 	struct scatterlist input;
+	struct lzo_ctx_group *ctx_group;
+	int ctx_idx;
 	struct lzo_ctx *ctx;
 	struct obj_cgroup *objcg = NULL;
 	struct zswap_pool *pool;
@@ -1247,8 +1296,9 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	}
 
 	/* compress */
-	ctx = raw_cpu_ptr(lzo_ctx);
-
+	ctx_group = raw_cpu_ptr(lzo_ctx_group);
+	ctx_idx = zswap_get_lzo_ctx(ctx_group);
+	ctx = ctx_group->ctxes[ctx_idx];
 	mutex_lock(ctx->mutex_comp);
 
 	sg_init_table(&input, 1);
@@ -1282,6 +1332,7 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	memcpy(buf + hlen, ctx->dst_comp, dlen);
 	zpool_unmap_handle(entry->pool->zpool, handle);
 	mutex_unlock(ctx->mutex_comp);
+	zswap_return_lzo_ctx(ctx_group, ctx_idx);
 
 	/* populate entry */
 	entry->offset = offset;
@@ -1318,6 +1369,7 @@ insert_entry:
 
 put_dstmem:
 	mutex_unlock(ctx->mutex_comp);
+	zswap_return_lzo_ctx(ctx_group, ctx_idx);
 	zswap_pool_put(entry->pool);
 freepage:
 	zswap_entry_cache_free(entry);
@@ -1393,6 +1445,7 @@ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
 		kfree(tmp);
 
 	BUG_ON(ret);
+	BUG_ON(dlen != PAGE_SIZE);
 stats:
 	count_vm_event(ZSWPIN);
 	if (entry->objcg)
@@ -1540,9 +1593,9 @@ static int __init init_zswap(void)
 
 	zswap_init_started = true;
 
-	lzo_ctx = alloc_percpu(*lzo_ctx);
-	if (!lzo_ctx) {
-		pr_err("percpu lzo ctx alloc failed\n");
+	lzo_ctx_group = alloc_percpu(*lzo_ctx_group);
+	if (!lzo_ctx_group) {
+		pr_err("percpu lzo_ctx_group alloc failed\n");
 		goto lzo_fail;
 	}
 	
@@ -1598,7 +1651,7 @@ hp_fail:
 dstmem_fail:
 	zswap_entry_cache_destroy();
 cache_fail:
-	free_percpu(lzo_ctx);
+	free_percpu(lzo_ctx_group);
 lzo_fail:
 	/* if built-in, we aren't unloaded on failure; don't allow use */
 	zswap_init_failed = true;
