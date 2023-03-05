@@ -561,8 +561,10 @@ static int zswap_dstmem_prepare(unsigned int cpu)
 		ctx = kmalloc_node(sizeof(*ctx), GFP_KERNEL, cpu_to_node(cpu));
 		if (!ctx)
 			goto fail;
-		if (!zswap_init_lzo_ctx(ctx, cpu))
+		if (!zswap_init_lzo_ctx(ctx, cpu)) {
+			kfree(ctx);
 			goto fail;
+		}
 		ctx_group->ctxes[i] = ctx;
 		ctx_group->wait_lists[i] = 0;
 	}
