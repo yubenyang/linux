@@ -169,10 +169,12 @@ struct lzo_ctx {
 };
 
 #define LZO_PER_CPU 4
+#define WAIT_LIST_MAX U32_MAX
+#define WAIT_LIST_MIN 0U
 
 struct lzo_ctx_group {
 	struct lzo_ctx *ctxes[LZO_PER_CPU];
-	u8 wait_lists[LZO_PER_CPU];
+	unsigned wait_lists[LZO_PER_CPU];
 	spinlock_t lock;
 };
 
@@ -225,10 +227,10 @@ static void zswap_free_lzo_ctx(struct lzo_ctx *ctx)
 static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
 {
 	
-	u8 wait_list = U8_MAX;
-	u8 tmp;
-	int ctx_idx;
-	
+	unsigned wait_list = WAIT_LIST_MAX;
+	unsigned tmp;
+	int ctx_idx = 0;
+
 	spin_lock(&ctx_group->lock);
 	
 	for (int i = 0; i < LZO_PER_CPU; i++) {
@@ -237,7 +239,7 @@ static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
 			wait_list = tmp;
 			ctx_idx = i;
 		}
-		if (wait_list == 0) {
+		if (wait_list == WAIT_LIST_MIN) {
 			break;
 		}
 	}
@@ -566,7 +568,7 @@ static int zswap_dstmem_prepare(unsigned int cpu)
 			goto fail;
 		}
 		ctx_group->ctxes[i] = ctx;
-		ctx_group->wait_lists[i] = 0;
+		ctx_group->wait_lists[i] = WAIT_LIST_MIN;
 	}
 	
 	return 0;
