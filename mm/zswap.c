@@ -177,6 +177,7 @@ static u32 ctx_id_usage_stat[LZO_PER_CPU];
 struct lzo_ctx_group {
 	struct lzo_ctx *ctxes[LZO_PER_CPU];
 	unsigned wait_lists[LZO_PER_CPU];
+	atomic_t round_robin;
 	spinlock_t lock;
 };
 
@@ -226,6 +227,30 @@ static void zswap_free_lzo_ctx(struct lzo_ctx *ctx)
 	kfree(ctx);
 }
 
+#define ZSWAP_GET_LZO_ROUND_ROBIN
+
+#ifdef ZSWAP_GET_LZO_ROUND_ROBIN
+
+#define ZSWAP_LZO_RESET_VAL 65536
+
+static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
+{
+	int tmp, ctx_idx;
+	
+	tmp = atomic_fetch_inc(&ctx_group->round_robin);
+	if (tmp == ZSWAP_LZO_RESET_VAL)
+		atomic_set(&ctx_group->round_robin, 0);
+
+	ctx_idx = tmp % LZO_PER_CPU;
+	ctx_id_usage_stat[ctx_idx]++;
+	
+	return ctx_idx;
+}
+
+static void zswap_return_lzo_ctx(struct lzo_ctx_group *ctx_group, int ctx_idx)
+{
+}
+#else
 static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
 {
 	
@@ -260,6 +285,7 @@ static void zswap_return_lzo_ctx(struct lzo_ctx_group *ctx_group, int ctx_idx)
 	(ctx_group->wait_lists[ctx_idx])--;
 	spin_unlock(&ctx_group->lock);
 }
+#endif
 
 static int zswap_lzo_decompress(const u8 *src, unsigned int slen, struct page *page, unsigned int *dlen)
 {
@@ -562,6 +588,7 @@ static int zswap_dstmem_prepare(unsigned int cpu)
 	int i = 0;
 
 	spin_lock_init(&ctx_group->lock);
+	atomic_set(&ctx_group->round_robin, 0);
 
 	for (; i < LZO_PER_CPU; i++) {
 		ctx = kmalloc_node(sizeof(*ctx), GFP_KERNEL, cpu_to_node(cpu));
