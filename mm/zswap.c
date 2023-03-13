@@ -172,6 +172,8 @@ struct lzo_ctx {
 #define WAIT_LIST_MAX U32_MAX
 #define WAIT_LIST_MIN 0U
 
+static u32 ctx_id_usage_stat[LZO_PER_CPU];
+
 struct lzo_ctx_group {
 	struct lzo_ctx *ctxes[LZO_PER_CPU];
 	unsigned wait_lists[LZO_PER_CPU];
@@ -244,6 +246,8 @@ static int zswap_get_lzo_ctx(struct lzo_ctx_group *ctx_group)
 		}
 	}
 	(ctx_group->wait_lists[ctx_idx])++;
+	
+	ctx_id_usage_stat[ctx_idx]++;
 
 	spin_unlock(&ctx_group->lock);
 
@@ -1550,6 +1554,8 @@ static const struct frontswap_ops zswap_frontswap_ops = {
 
 static struct dentry *zswap_debugfs_root;
 
+static struct debugfs_u32_array ctx_id_usage_stat_warpper;
+
 static int __init zswap_debugfs_init(void)
 {
 	if (!debugfs_initialized())
@@ -1577,6 +1583,11 @@ static int __init zswap_debugfs_init(void)
 				zswap_debugfs_root, &zswap_stored_pages);
 	debugfs_create_atomic_t("same_filled_pages", 0444,
 				zswap_debugfs_root, &zswap_same_filled_pages);
+	
+	ctx_id_usage_stat_warpper.array = ctx_id_usage_stat;
+	ctx_id_usage_stat_warpper.n_elements = LZO_PER_CPU;
+	debugfs_create_u32_array("ctx_id_usage_stat", 0444, 
+				zswap_debugfs_root, &ctx_id_usage_stat_warpper);
 
 	return 0;
 }
