@@ -238,7 +238,7 @@ static void zswap_free_lzo_ctx(struct lzo_ctx *ctx)
 	kfree(ctx);
 }
 
-#define ZSWAP_GET_LZO_ROUND_ROBIN
+//#define ZSWAP_GET_LZO_ROUND_ROBIN
 
 #ifdef ZSWAP_GET_LZO_ROUND_ROBIN
 
