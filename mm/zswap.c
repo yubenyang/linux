@@ -161,8 +161,14 @@ struct zswap_pool {
 	char tfm_name[CRYPTO_MAX_ALG_NAME];
 };
 
+#define ZSWAP_NO_MUTEX
+
 struct lzo_ctx {
-	struct mutex *mutex_comp;
+#ifdef ZSWAP_NO_MUTEX
+	spinlock_t *lock_comp;
+#else
+	struct mutex *lock_comp;
+#endif
 	u8 *src_comp;
 	u8 *dst_comp;
 	void *wrkmem;
@@ -197,20 +203,25 @@ static bool zswap_init_lzo_ctx(struct lzo_ctx *ctx, unsigned int cpu)
 	if (!ctx->dst_comp) 
 		goto dst_comp_fail;
 
-	ctx->mutex_comp = kmalloc_node(sizeof(struct mutex), GFP_KERNEL, cpu_to_node(cpu));
-	if (!ctx->mutex_comp) 
-		goto mutex_comp_fail;
+	ctx->lock_comp = kmalloc_node(sizeof(*(ctx->lock_comp)), GFP_KERNEL, cpu_to_node(cpu));
+	if (!ctx->lock_comp) 
+		goto lock_comp_fail;
 
 	ctx->wrkmem = kvmalloc_node(LZO1X_MEM_COMPRESS, GFP_KERNEL, cpu_to_node(cpu));
 	if (!ctx->wrkmem) 
 		goto wrkmem_fail;
 
-	mutex_init(ctx->mutex_comp);
+#ifdef ZSWAP_NO_MUTEX
+	spin_lock_init(ctx->lock_comp);
+#else
+	mutex_init(ctx->lock_comp);
+#endif
+
 	return true;
 
 wrkmem_fail:
-	kfree(ctx->mutex_comp);
-mutex_comp_fail:
+	kfree(ctx->lock_comp);
+lock_comp_fail:
 	kfree(ctx->dst_comp);
 dst_comp_fail:
 	kfree(ctx->src_comp);
@@ -221,7 +232,7 @@ src_comp_fail:
 static void zswap_free_lzo_ctx(struct lzo_ctx *ctx) 
 {
 	kvfree(ctx->wrkmem);
-	kfree(ctx->mutex_comp);
+	kfree(ctx->lock_comp);
 	kfree(ctx->dst_comp);
 	kfree(ctx->src_comp);
 	kfree(ctx);
@@ -1334,7 +1345,11 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	ctx_group = raw_cpu_ptr(lzo_ctx_group);
 	ctx_idx = zswap_get_lzo_ctx(ctx_group);
 	ctx = ctx_group->ctxes[ctx_idx];
-	mutex_lock(ctx->mutex_comp);
+#ifdef ZSWAP_NO_MUTEX
+	spin_lock(ctx->lock_comp);
+#else
+	mutex_lock(ctx->lock_comp);
+#endif
 
 	sg_init_table(&input, 1);
 	sg_set_page(&input, page, PAGE_SIZE, 0);
@@ -1366,7 +1381,11 @@ static int zswap_frontswap_store(unsigned type, pgoff_t offset,
 	memcpy(buf, &zhdr, hlen);
 	memcpy(buf + hlen, ctx->dst_comp, dlen);
 	zpool_unmap_handle(entry->pool->zpool, handle);
-	mutex_unlock(ctx->mutex_comp);
+#ifdef ZSWAP_NO_MUTEX
+	spin_unlock(ctx->lock_comp);
+#else
+	mutex_unlock(ctx->lock_comp);
+#endif
 	zswap_return_lzo_ctx(ctx_group, ctx_idx);
 
 	/* populate entry */
@@ -1403,7 +1422,11 @@ insert_entry:
 	return 0;
 
 put_dstmem:
-	mutex_unlock(ctx->mutex_comp);
+#ifdef ZSWAP_NO_MUTEX
+	spin_unlock(ctx->lock_comp);
+#else
+	mutex_unlock(ctx->lock_comp);
+#endif
 	zswap_return_lzo_ctx(ctx_group, ctx_idx);
 	zswap_pool_put(entry->pool);
 freepage:
