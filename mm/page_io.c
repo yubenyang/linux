@@ -208,6 +208,36 @@ out:
 	return ret;
 }
 
+int swap_writepage_sync(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	int ret = 0;
+
+	if (folio_free_swap(folio)) {
+		folio_unlock(folio);
+		goto out;
+	}
+	/*
+	 * Arch code may have to preserve more data than just the page
+	 * contents, e.g. memory tags.
+	 */
+	ret = arch_prepare_to_swap(&folio->page);
+	if (ret) {
+		folio_mark_dirty(folio);
+		folio_unlock(folio);
+		goto out;
+	}
+	if (frontswap_store(&folio->page) == 0) {
+		folio_start_writeback(folio);
+		folio_unlock(folio);
+		folio_end_writeback(folio);
+		goto out;
+	}
+	return -1;
+out:
+	return ret;
+}
+
 static inline void count_swpout_vm_event(struct page *page)
 {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
