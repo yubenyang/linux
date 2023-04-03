@@ -1217,6 +1217,8 @@ typedef enum {
 	PAGE_SUCCESS,
 	/* folio is clean and locked */
 	PAGE_CLEAN,
+	/* folio is fail in sync pageout, folio is locked */
+	PAGE_FAIL,
 } pageout_t;
 
 /*
@@ -1279,6 +1281,74 @@ static pageout_t pageout(struct folio *folio, struct address_space *mapping,
 		if (res == AOP_WRITEPAGE_ACTIVATE) {
 			folio_clear_reclaim(folio);
 			return PAGE_ACTIVATE;
+		}
+
+		if (!folio_test_writeback(folio)) {
+			/* synchronous write or broken a_ops? */
+			folio_clear_reclaim(folio);
+		}
+		trace_mm_vmscan_write_folio(folio);
+		node_stat_add_folio(folio, NR_VMSCAN_WRITE);
+		return PAGE_SUCCESS;
+	}
+
+	return PAGE_CLEAN;
+}
+
+static pageout_t pageout_sync(struct folio *folio, struct address_space *mapping,
+			 struct swap_iocb **plug)
+{
+	/*
+	 * If the folio is dirty, only perform writeback if that write
+	 * will be non-blocking.  To prevent this allocation from being
+	 * stalled by pagecache activity.  But note that there may be
+	 * stalls if we need to run get_block().  We could test
+	 * PagePrivate for that.
+	 *
+	 * If this process is currently in __generic_file_write_iter() against
+	 * this folio's queue, we can perform writeback even if that
+	 * will block.
+	 *
+	 * If the folio is swapcache, write it back even if that would
+	 * block, for some throttling. This happens by accident, because
+	 * swap_backing_dev_info is bust: it doesn't reflect the
+	 * congestion state of the swapdevs.  Easy to fix, if needed.
+	 */
+	if (!is_page_cache_freeable(folio))
+		return PAGE_KEEP;
+	if (!mapping) {
+		/*
+		 * Some data journaling orphaned folios can have
+		 * folio->mapping == NULL while being dirty with clean buffers.
+		 */
+		if (folio_test_private(folio)) {
+			if (try_to_free_buffers(folio)) {
+				folio_clear_dirty(folio);
+				pr_info("%s: orphaned folio\n", __func__);
+				return PAGE_CLEAN;
+			}
+		}
+		return PAGE_KEEP;
+	}
+	if (mapping->a_ops->writepage == NULL)
+		return PAGE_ACTIVATE;
+
+	if (folio_clear_dirty_for_io(folio)) {
+		int res;
+		struct writeback_control wbc = {
+			.sync_mode = WB_SYNC_NONE,
+			.nr_to_write = SWAP_CLUSTER_MAX,
+			.range_start = 0,
+			.range_end = LLONG_MAX,
+			.for_reclaim = 1,
+			.swap_plug = plug,
+		};
+
+		folio_set_reclaim(folio);
+		res = swap_writepage_sync(&folio->page);
+		if (res == -1) {
+			folio_clear_reclaim(folio);
+			return PAGE_FAIL;
 		}
 
 		if (!folio_test_writeback(folio)) {
