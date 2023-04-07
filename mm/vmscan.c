@@ -1693,6 +1693,33 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 	return !data_race(folio_swap_flags(folio) & SWP_FS_OPS);
 }
 
+static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
+		struct pglist_data *pgdat, struct scan_control *sc,
+		struct reclaim_stat *stat, bool ignore_references,
+		struct list_head *ret_folios, struct list_head *free_folios)
+{
+	LIST_HEAD(fast_folios);
+	unsigned int nr_reclaimed = 0;
+	struct folio *folio, *next_folio;
+
+	list_for_each_entry_safe_reverse(folio, next_folio, folio_list, lru) {
+		if (folio_test_anon(folio) && folio_test_swapbacked(folio) && !folio_test_large(folio))
+			list_move(&folio->lru, &fast_folios);
+	}
+
+	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
+
+	}
+
+	try_to_unmap_flush();
+
+	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
+
+	}
+
+	return nr_reclaimed;
+}
+
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
