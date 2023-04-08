@@ -1708,7 +1708,100 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 	}
 
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
+		enum folio_references references = FOLIOREF_RECLAIM;
+		VM_BUG_ON_FOLIO(folio_nr_pages(folio) > 1, folio);
+		unsigned int nr_pages = 1;
 
+		if (!folio_trylock(folio))
+			goto skip;
+
+		if (folio_test_reclaim(folio) || folio_test_writeback(folio))
+			goto skip_locked;
+
+		sc->nr_scanned += nr_pages;
+
+		if (unlikely(!folio_evictable(folio)))
+			goto activate_locked;
+
+		if (!sc->may_unmap && folio_mapped(folio))
+			goto keep_locked;
+
+		if (lru_gen_enabled() && !ignore_references &&
+		    folio_mapped(folio) && folio_test_referenced(folio))
+			goto keep_locked;
+
+		if (!ignore_references)
+			references = folio_check_references(folio, sc);
+
+		switch (references) {
+		case FOLIOREF_ACTIVATE:
+			goto activate_locked;
+		case FOLIOREF_KEEP:
+			stat->nr_ref_keep += nr_pages;
+			goto keep_locked;
+		case FOLIOREF_RECLAIM:
+		case FOLIOREF_RECLAIM_CLEAN:
+			; /* try to reclaim the folio below */
+		}
+
+		if (!folio_test_swapcache(folio)) {
+			if (!(sc->gfp_mask & __GFP_IO))
+				goto keep_locked;
+			if (folio_maybe_dma_pinned(folio))
+				goto keep_locked;
+			if (!add_to_swap(folio))
+				goto activate_locked;
+
+		if (folio_mapped(folio)) {
+			enum ttu_flags flags = TTU_BATCH_FLUSH;
+			bool was_swapbacked = folio_test_swapbacked(folio);
+
+			if (folio_test_pmd_mappable(folio))
+				flags |= TTU_SPLIT_HUGE_PMD;
+
+			try_to_unmap(folio, flags);
+			if (folio_mapped(folio)) {
+				stat->nr_unmap_fail += nr_pages;
+				if (!was_swapbacked &&
+				    folio_test_swapbacked(folio))
+					stat->nr_lazyfree_fail += nr_pages;
+				goto activate_locked;
+			}
+		}
+
+		if (references == FOLIOREF_RECLAIM_CLEAN)
+				goto keep_locked;
+			if (!may_enter_fs(folio, sc->gfp_mask))
+				goto keep_locked;
+			if (!sc->may_writepage)
+				goto keep_locked;
+
+		/* Stays in fast_folios. The page is still locked and ready for sync swap-out. */
+		continue;
+
+		/* Goes to ret_folios */
+activate_locked:
+		/* Not a candidate for swapping, so reclaim swap space. */
+		if (folio_test_swapcache(folio) &&
+		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
+			folio_free_swap(folio);
+		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+		if (!folio_test_mlocked(folio)) {
+			int type = folio_is_file_lru(folio);
+			folio_set_active(folio);
+			stat->nr_activate[type] += nr_pages;
+			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
+		}
+keep_locked:
+		folio_unlock(folio);
+		list_move(&folio->lru, ret_folios);
+		continue;
+
+		/* Goes to folio_list */
+skip_locked:
+		folio_unlock(folio);
+skip:
+		list_move(&folio->lru, folio_list);
 	}
 
 	try_to_unmap_flush();
