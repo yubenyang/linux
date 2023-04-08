@@ -1807,7 +1807,46 @@ skip:
 	try_to_unmap_flush();
 
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
+		struct address_space *mapping;
+		unsigned int nr_pages = 1;
 
+		mapping = folio_mapping(folio);
+		switch (pageout_sync(folio, mapping, NULL)) {
+		case PAGE_KEEP:
+			goto fail_locked;
+		case PAGE_ACTIVATE:
+			goto fail_locked;
+		case PAGE_FAIL:
+			goto fail_locked;
+		case PAGE_SUCCESS:
+			stat->nr_pageout += nr_pages;
+
+			if (!folio_trylock(folio))
+				goto fail;
+			if (folio_test_dirty(folio) ||
+				folio_test_writeback(folio))
+				goto fail_locked;
+			mapping = folio_mapping(folio);
+			fallthrough;
+		case PAGE_CLEAN:
+			; /* try to free the folio below */
+		}
+
+		if (!mapping || !__remove_mapping(mapping, folio, true,
+							 sc->target_mem_cgroup))
+			goto fail_locked;
+
+		/* Goes to free_folios */
+		folio_unlock(folio);
+		nr_reclaimed += nr_pages;
+		list_move(&folio->lru, free_folios);
+		continue;
+
+		/* Goes to folio_list */
+fail_locked:
+		folio_unlock(folio);
+fail:
+		list_move(&folio->lru, folio_list);
 	}
 
 	return nr_reclaimed;
