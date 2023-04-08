@@ -1700,6 +1700,7 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 {
 	LIST_HEAD(fast_folios);
 	unsigned int nr_reclaimed = 0;
+	unsigned int nr_pages = 1;
 	struct folio *folio, *next_folio;
 
 	list_for_each_entry_safe_reverse(folio, next_folio, folio_list, lru) {
@@ -1710,7 +1711,6 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
 		enum folio_references references = FOLIOREF_RECLAIM;
 		VM_BUG_ON_FOLIO(folio_nr_pages(folio) > 1, folio);
-		unsigned int nr_pages = 1;
 
 		if (!folio_trylock(folio))
 			goto skip;
@@ -1751,6 +1751,7 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 				goto keep_locked;
 			if (!add_to_swap(folio))
 				goto activate_locked;
+		}
 
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
@@ -1808,7 +1809,6 @@ skip:
 
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
 		struct address_space *mapping;
-		unsigned int nr_pages = 1;
 
 		mapping = folio_mapping(folio);
 		switch (pageout_sync(folio, mapping, NULL)) {
