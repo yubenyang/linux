@@ -1770,12 +1770,14 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 			}
 		}
 
-		if (references == FOLIOREF_RECLAIM_CLEAN)
+		if (folio_test_dirty(folio)) {
+			if (references == FOLIOREF_RECLAIM_CLEAN)
 				goto keep_locked;
 			if (!may_enter_fs(folio, sc->gfp_mask))
 				goto keep_locked;
 			if (!sc->may_writepage)
 				goto keep_locked;
+		}
 
 		/* Stays in fast_folios. The page is still locked and ready for sync swap-out. */
 		continue;
@@ -1811,25 +1813,27 @@ skip:
 		struct address_space *mapping;
 
 		mapping = folio_mapping(folio);
-		switch (pageout_sync(folio, mapping, NULL)) {
-		case PAGE_KEEP:
-			goto fail_locked;
-		case PAGE_ACTIVATE:
-			goto fail_locked;
-		case PAGE_FAIL:
-			goto fail_locked;
-		case PAGE_SUCCESS:
-			stat->nr_pageout += nr_pages;
-
-			if (!folio_trylock(folio))
-				goto fail;
-			if (folio_test_dirty(folio) ||
-				folio_test_writeback(folio))
+		if (folio_test_dirty(folio)) {
+			switch (pageout_sync(folio, mapping, NULL)) {
+			case PAGE_KEEP:
 				goto fail_locked;
-			mapping = folio_mapping(folio);
-			fallthrough;
-		case PAGE_CLEAN:
-			; /* try to free the folio below */
+			case PAGE_ACTIVATE:
+				goto fail_locked;
+			case PAGE_FAIL:
+				goto fail_locked;
+			case PAGE_SUCCESS:
+				stat->nr_pageout += nr_pages;
+
+				if (!folio_trylock(folio))
+					goto fail;
+				if (folio_test_dirty(folio) ||
+					folio_test_writeback(folio))
+					goto fail_locked;
+				mapping = folio_mapping(folio);
+				fallthrough;
+			case PAGE_CLEAN:
+				; /* try to free the folio below */
+			}
 		}
 
 		if (!mapping || !__remove_mapping(mapping, folio, true,
