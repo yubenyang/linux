@@ -1875,6 +1875,9 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	cond_resched();
 	do_demote_pass = can_demote(pgdat->node_id, sc);
 
+	nr_reclaimed += shrink_folio_list_fast_path(folio_list, pgdat, 
+		sc, stat, ignore_references, &ret_folios, &free_folios);
+
 retry:
 	while (!list_empty(folio_list)) {
 		struct address_space *mapping;
