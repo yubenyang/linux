@@ -161,7 +161,7 @@ struct zswap_pool {
 	char tfm_name[CRYPTO_MAX_ALG_NAME];
 };
 
-#define ZSWAP_NO_MUTEX
+//#define ZSWAP_NO_MUTEX
 
 struct lzo_ctx {
 #ifdef ZSWAP_NO_MUTEX
@@ -174,7 +174,7 @@ struct lzo_ctx {
 	void *wrkmem;
 };
 
-#define LZO_PER_CPU 4
+#define LZO_PER_CPU 1
 #define WAIT_LIST_MAX U32_MAX
 #define WAIT_LIST_MIN 0U
 
