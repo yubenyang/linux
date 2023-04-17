@@ -1878,6 +1878,8 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	nr_reclaimed += shrink_folio_list_fast_path(folio_list, pgdat, 
 		sc, stat, ignore_references, &ret_folios, &free_folios);
 
+	cond_resched();
+
 retry:
 	while (!list_empty(folio_list)) {
 		struct address_space *mapping;
