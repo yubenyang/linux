@@ -1872,13 +1872,12 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	struct swap_iocb *plug = NULL;
 
 	memset(stat, 0, sizeof(*stat));
-	cond_resched();
-	do_demote_pass = can_demote(pgdat->node_id, sc);
 
 	nr_reclaimed += shrink_folio_list_fast_path(folio_list, pgdat, 
 		sc, stat, ignore_references, &ret_folios, &free_folios);
 
 	cond_resched();
+	do_demote_pass = can_demote(pgdat->node_id, sc);
 
 retry:
 	while (!list_empty(folio_list)) {
