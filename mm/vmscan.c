@@ -1711,6 +1711,7 @@ static unsigned int shrink_folio_list_fast_path(struct list_head *folio_list,
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
 		enum folio_references references = FOLIOREF_RECLAIM;
 		VM_BUG_ON_FOLIO(folio_nr_pages(folio) > 1, folio);
+		cond_resched();
 
 		if (!folio_trylock(folio))
 			goto skip;
@@ -1811,6 +1812,7 @@ skip:
 
 	list_for_each_entry_safe(folio, next_folio, &fast_folios, lru) {
 		struct address_space *mapping;
+		cond_resched();
 
 		mapping = folio_mapping(folio);
 		if (folio_test_dirty(folio)) {
