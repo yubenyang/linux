@@ -13,6 +13,52 @@
 #include <asm/pti.h>
 #include <asm/processor-flags.h>
 
+/*
+ * TLB flushing:
+ *
+ *  - flush_tlb_all() flushes all processes TLBs
+ *  - flush_tlb_mm(mm) flushes the specified mm context TLB's
+ *  - flush_tlb_page(vma, vmaddr) flushes one page
+ *  - flush_tlb_range(vma, start, end) flushes a range of pages
+ *  - flush_tlb_kernel_range(start, end) flushes a range of kernel pages
+ *  - flush_tlb_multi(cpumask, info) flushes TLBs on multiple cpus
+ *
+ * ..but the i386 has somewhat limited tlb flushing capabilities,
+ * and page-granular flushes are available only on i486 and up.
+ */
+struct flush_tlb_info {
+	/*
+	 * We support several kinds of flushes.
+	 *
+	 * - Fully flush a single mm.  .mm will be set, .end will be
+	 *   TLB_FLUSH_ALL, and .new_tlb_gen will be the tlb_gen to
+	 *   which the IPI sender is trying to catch us up.
+	 *
+	 * - Partially flush a single mm.  .mm will be set, .start and
+	 *   .end will indicate the range, and .new_tlb_gen will be set
+	 *   such that the changes between generation .new_tlb_gen-1 and
+	 *   .new_tlb_gen are entirely contained in the indicated range.
+	 *
+	 * - Fully flush all mms whose tlb_gens have been updated.  .mm
+	 *   will be NULL, .end will be TLB_FLUSH_ALL, and .new_tlb_gen
+	 *   will be zero.
+	 */
+	struct mm_struct	*mm;
+	unsigned long		start;
+	unsigned long		end;
+	u64			new_tlb_gen;
+	unsigned int		initiating_cpu;
+	u8			stride_shift;
+	u8			freed_tables;
+};
+
+void flush_tlb_func(void *info);
+struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+			unsigned long start, unsigned long end,
+			unsigned int stride_shift, bool freed_tables,
+			u64 new_tlb_gen);
+void put_flush_tlb_info(void);
+
 void __flush_tlb_all(void);
 
 #define TLB_FLUSH_ALL	-1UL
@@ -170,45 +216,6 @@ extern unsigned long mmu_cr4_features;
 extern u32 *trampoline_cr4_features;
 
 extern void initialize_tlbstate_and_flush(void);
-
-/*
- * TLB flushing:
- *
- *  - flush_tlb_all() flushes all processes TLBs
- *  - flush_tlb_mm(mm) flushes the specified mm context TLB's
- *  - flush_tlb_page(vma, vmaddr) flushes one page
- *  - flush_tlb_range(vma, start, end) flushes a range of pages
- *  - flush_tlb_kernel_range(start, end) flushes a range of kernel pages
- *  - flush_tlb_multi(cpumask, info) flushes TLBs on multiple cpus
- *
- * ..but the i386 has somewhat limited tlb flushing capabilities,
- * and page-granular flushes are available only on i486 and up.
- */
-struct flush_tlb_info {
-	/*
-	 * We support several kinds of flushes.
-	 *
-	 * - Fully flush a single mm.  .mm will be set, .end will be
-	 *   TLB_FLUSH_ALL, and .new_tlb_gen will be the tlb_gen to
-	 *   which the IPI sender is trying to catch us up.
-	 *
-	 * - Partially flush a single mm.  .mm will be set, .start and
-	 *   .end will indicate the range, and .new_tlb_gen will be set
-	 *   such that the changes between generation .new_tlb_gen-1 and
-	 *   .new_tlb_gen are entirely contained in the indicated range.
-	 *
-	 * - Fully flush all mms whose tlb_gens have been updated.  .mm
-	 *   will be NULL, .end will be TLB_FLUSH_ALL, and .new_tlb_gen
-	 *   will be zero.
-	 */
-	struct mm_struct	*mm;
-	unsigned long		start;
-	unsigned long		end;
-	u64			new_tlb_gen;
-	unsigned int		initiating_cpu;
-	u8			stride_shift;
-	u8			freed_tables;
-};
 
 void flush_tlb_local(void);
 void flush_tlb_one_user(unsigned long addr);

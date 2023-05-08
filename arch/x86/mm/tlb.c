@@ -720,7 +720,7 @@ void initialize_tlbstate_and_flush(void)
  * because all x86 flush operations are serializing and the
  * atomic64_read operation won't be reordered by the compiler.
  */
-static void flush_tlb_func(void *info)
+void flush_tlb_func(void *info)
 {
 	/*
 	 * We have three different tlb_gen values in here.  They are:
@@ -877,6 +877,7 @@ done:
 						  TLB_LOCAL_MM_SHOOTDOWN,
 			nr_invalidate);
 }
+EXPORT_SYMBOL_GPL(flush_tlb_func);
 
 static bool tlb_is_not_lazy(int cpu, void *data)
 {
@@ -942,7 +943,7 @@ static DEFINE_PER_CPU_SHARED_ALIGNED(struct flush_tlb_info, flush_tlb_info);
 static DEFINE_PER_CPU(unsigned int, flush_tlb_info_idx);
 #endif
 
-static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
+struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
 			unsigned long start, unsigned long end,
 			unsigned int stride_shift, bool freed_tables,
 			u64 new_tlb_gen)
@@ -968,8 +969,9 @@ static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
 
 	return info;
 }
+EXPORT_SYMBOL_GPL(get_flush_tlb_info);
 
-static void put_flush_tlb_info(void)
+void put_flush_tlb_info(void)
 {
 #ifdef CONFIG_DEBUG_VM
 	/* Complete reentrancy prevention checks */
@@ -977,6 +979,7 @@ static void put_flush_tlb_info(void)
 	this_cpu_dec(flush_tlb_info_idx);
 #endif
 }
+EXPORT_SYMBOL_GPL(put_flush_tlb_info);
 
 void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 				unsigned long end, unsigned int stride_shift,
