@@ -713,6 +713,18 @@ void initialize_tlbstate_and_flush(void)
 		this_cpu_write(cpu_tlbstate.ctxs[i].ctx_id, 0);
 }
 
+void flush_tlb_func_dummy(void *info)
+{
+	const struct flush_tlb_info *f = info;
+	bool local = smp_processor_id() == f->initiating_cpu;
+	VM_WARN_ON(!irqs_disabled());
+	if (!local) {
+		inc_irq_stat(irq_tlb_count);
+		inc_irq_stat(irq_tlb_count);
+	}
+}
+EXPORT_SYMBOL_GPL(flush_tlb_func_dummy);
+
 /*
  * flush_tlb_func()'s memory ordering requirement is that any
  * TLB fills that happen after we flush the TLB are ordered after we
