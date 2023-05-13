@@ -52,6 +52,7 @@ struct flush_tlb_info {
 	u8			freed_tables;
 };
 
+void flush_tlb_func_force(void *info);
 void flush_tlb_func_dummy(void *info);
 void flush_tlb_func(void *info);
 struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
