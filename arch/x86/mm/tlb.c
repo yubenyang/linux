@@ -781,16 +781,6 @@ void flush_tlb_func_force(void *info)
 	 */
 	mm_tlb_gen = atomic64_read(&loaded_mm->context.tlb_gen);
 
-	if (unlikely(local_tlb_gen == mm_tlb_gen)) {
-		/*
-		 * There's nothing to do: we're already up to date.  This can
-		 * happen if two concurrent flushes happen -- the first flush to
-		 * be handled can catch us all the way up, leaving no work for
-		 * the second flush.
-		 */
-		goto done;
-	}
-
 	WARN_ON_ONCE(local_tlb_gen > mm_tlb_gen);
 	WARN_ON_ONCE(f->new_tlb_gen > mm_tlb_gen);
 
